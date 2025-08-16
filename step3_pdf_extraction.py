@@ -63,22 +63,23 @@ class PDFExtractor:
             }}
             
             Text SPC:
-            {text[:3000]}  # Více textu pro lepší analýzu
+            {text[:1500]}  # Menší text pro rychlejší zpracování
             
             Vrať pouze JSON, žádné další texty.
             """
             
-            # Volání AI modelu
+            # Volání AI modelu - použijeme nejmenší dostupný model
             response = self.ollama_client.chat(
-                model='gemma3',  # Vrátíme se k Gemma3 pro lepší češtinu
+                model='qwen2:1.5b',  # Nejmenší model pro CPU
                 messages=[{
                     'role': 'user',
                     'content': prompt
                 }],
                 options={
-                    'num_ctx': 4096,  # Větší kontext pro lepší analýzu
-                    'num_thread': 8,  # Více vláken pro rychlost
-                    'temperature': 0.3  # Vyšší teplota pro kreativnější analýzu
+                    'num_ctx': 2048,  # Menší kontext pro úsporu paměti
+                    'num_thread': 4,  # Méně vláken, aby nezatížilo CPU
+                    'temperature': 0.1,  # Velmi nízká teplota pro stabilitu
+                    'num_predict': 512  # Omezíme délku odpovědi
                 }
             )
             
@@ -270,7 +271,7 @@ def main():
                     AND l.kod_sukl NOT IN (
                         SELECT kod_sukl FROM extracted_info
                     )
-                    LIMIT 2
+                    LIMIT 1  -- Zpracováváme pouze 1 lék pro test
                 """
                 logger.info(f"SQL dotaz: {query}")
                 cursor.execute(query)
@@ -300,8 +301,8 @@ def main():
                         else:
                             logger.error(f"❌ Chyba při ukládání pro {kod_sukl}")
                         
-                        # Kratší pauza mezi zpracováním pro rychlost
-                        time.sleep(2)
+                        # Delší pauza pro ochlazení CPU
+                        time.sleep(30)  # 30 sekund pauza pro ochlazení
                         
                     except Exception as e:
                         logger.error(f"Chyba při zpracování {kod_sukl}: {e}")

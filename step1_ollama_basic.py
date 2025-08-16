@@ -95,7 +95,10 @@ def main():
             print(f"   📋 {model['name']} ({model.get('size', 'N/A')} MB)")
     else:
         print("   ⚠️  Žádné modely nejsou staženy")
-        print("   💡 Stáhněte rychlý model: ollama pull phi")
+        print("   💡 Doporučené rychlé modely pro CPU:")
+        print("      ollama pull phi3:mini        # 2.3GB - nejrychlejší")
+        print("      ollama pull gemma2:2b        # 1.6GB - velmi rychlý")
+        print("      ollama pull qwen2:1.5b       # 934MB - nejmenší")
         return
     
     # Test generování textu - rychlý test

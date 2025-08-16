@@ -21,7 +21,7 @@ class SUKLAPIClient:
         self.base_url = base_url
         self.session = requests.Session()
    
-    def get_medicines_list(self, period: str = "2025.07", ) -> List[str]:
+    def get_medicines_list(self, period: str = "2025.08", ) -> List[str]:
         """Získá seznam kódů léků"""
         params = f"obdobi={period}&uvedeneCeny=false&typSeznamu=dlpo"
         url = f"{self.base_url}/lecive-pripravky?{params}"
@@ -81,19 +81,44 @@ class SUKLAPIClient:
             logger.error(f"Chyba při stahování metadat dokumentů pro {kod_sukl}: {e}")
             return []
     
-    def download_document(self, kod_sukl: str, doc_type: str = "spc") -> bytes:
+    def download_document(self, kod_sukl: str, doc_type: str = "spc", is_eu_registration: bool = False, max_retries: int = 3) -> bytes:
         """Stáhne PDF dokument podle kódu SÚKL a typu dokumentu"""
         url = f"{self.base_url}/dokumenty/{kod_sukl}/{doc_type}"
         
-        try:
-            response = self.session.get(url, timeout=60)
-            response.raise_for_status()
-            
-            return response.content
-            
-        except Exception as e:
-            logger.error(f"Chyba při stahování dokumentu {kod_sukl}/{doc_type}: {e}")
-            return b""
+        # Delší pauza pro EU registrace (EMA server)
+        if is_eu_registration:
+            logger.info(f"  ⚠️  EU registrace - používám delší pauzu pro EMA server")
+            time.sleep(3)  # 3 sekundy pro EMA
+        
+        for attempt in range(max_retries):
+            try:
+                response = self.session.get(url, timeout=60)
+                response.raise_for_status()
+                
+                return response.content
+                
+            except requests.exceptions.HTTPError as e:
+                if e.response.status_code == 429:  # Too Many Requests
+                    wait_time = (2 ** attempt) * 5  # Exponential backoff: 5, 10, 20 sekund
+                    logger.warning(f"  ⚠️  429 Too Many Requests - čekám {wait_time}s (pokus {attempt + 1}/{max_retries})")
+                    if attempt < max_retries - 1:
+                        time.sleep(wait_time)
+                        continue
+                    else:
+                        logger.error(f"Příliš mnoho požadavků i po {max_retries} pokusech")
+                        return b""
+                else:
+                    raise
+                    
+            except Exception as e:
+                logger.error(f"Chyba při stahování dokumentu {kod_sukl}/{doc_type}: {e}")
+                if attempt < max_retries - 1:
+                    logger.info(f"  🔄 Opakuji za 2 sekundy (pokus {attempt + 2}/{max_retries})")
+                    time.sleep(2)
+                    continue
+                return b""
+        
+        return b""
 
 class DatabaseManager:
     """Správce databáze PostgreSQL"""
@@ -280,6 +305,9 @@ def main():
     """Hlavní funkce pro stahování dat"""
     logger.info("🚀 Začínám stahování dat z SÚKL API")
     
+    # Konfigurace
+    SKIP_EU_REGISTRATIONS = True  # Nastavte na False pokud chcete stahovat i EU registrace
+    
     # Inicializace klientů
     api_client = SUKLAPIClient()
     db_manager = DatabaseManager()
@@ -293,47 +321,79 @@ def main():
     
     logger.info(f"Načteno {len(medicine_codes)} léků k zpracování")
     
-    # Omezení pro test (prvních 10 léků)
-    test_codes = medicine_codes[:10]
-    logger.info(f"Testuji s prvních {len(test_codes)} léky")
+    # Nastavení pro test
+    TARGET_MEDICINES = 10  # Počet léčiv s PDF, které chceme získat
+    MAX_ATTEMPTS = 5000      # Maximální počet pokusů (aby se nám nezacyklilo)
     
     success_count = 0
     document_count = 0
+    skipped_eu_count = 0
+    processed_count = 0
     
-    for i, kod_sukl in enumerate(test_codes, 1):
-        logger.info(f"Zpracovávám {i}/{len(test_codes)}: {kod_sukl}")
+    logger.info(f"Cíl: získat {TARGET_MEDICINES} léčiv s PDF dokumenty (max {MAX_ATTEMPTS} pokusů)")
+    
+    for kod_sukl in medicine_codes:
+        processed_count += 1
+        logger.info(f"Zpracovávám {processed_count}: {kod_sukl} (úspěšně: {success_count}/{TARGET_MEDICINES})")
+        
+        # Kontrola ukončení - buď dosáhli cíle nebo vyčerpali pokusy
+        if success_count >= TARGET_MEDICINES:
+            logger.info(f"🎯 Dosažen cíl {TARGET_MEDICINES} léčiv s PDF!")
+            break
+        
+        if processed_count > MAX_ATTEMPTS:
+            logger.warning(f"⚠️  Dosažen limit {MAX_ATTEMPTS} pokusů")
+            break
         
         try:
             # 2. Získání detailu léku
             medicine_detail = api_client.get_medicine_detail(kod_sukl)
-            if medicine_detail:
-                if db_manager.save_medicine(medicine_detail):
-                    success_count += 1
-                    logger.info(f"✅ Léky uložen: {medicine_detail.get('nazev', kod_sukl)}")
-                else:
-                    logger.error(f"❌ Chyba při ukládání léku: {kod_sukl}")
             
-            # 3. Získání dokumentů - stahujeme přímo SPC dokument
+            if not medicine_detail:
+                logger.warning(f"  ⚠️  Nepodařilo se získat detail léku {kod_sukl}")
+                continue
+            
+            # Kontrola EU registrace
+            registracni_cislo = medicine_detail.get('registracniCislo', '')
+            is_eu_registration = str(registracni_cislo).startswith('EU')
+            
+            # Přeskočení celého léčiva pokud je EU registrace a nechceme je
+            if is_eu_registration and SKIP_EU_REGISTRATIONS:
+                logger.info(f"  ⏭️  Přeskakuji celé léčivo s EU registrací: {registracni_cislo} ({medicine_detail.get('nazev', kod_sukl)})")
+                skipped_eu_count += 1
+                continue
+            
+            if is_eu_registration:
+                logger.info(f"  🇪🇺 EU registrace: {registracni_cislo}")
+            
+            # 3. Stahování SPC dokumentu nejdříve
             logger.info(f"  📄 Stahuji SPC dokument pro {kod_sukl}")
             
-            pdf_content = api_client.download_document(kod_sukl, "spc")
-            if pdf_content:
-                # Vytvoříme jednoduchý objekt dokumentu pro uložení
-                doc_data = {
-                    'id': kod_sukl,
-                    'nazev': f'SPC_{kod_sukl}.pdf',
-                    'typ': 'spc'
-                }
-                if db_manager.save_document(kod_sukl, doc_data, pdf_content):
-                    document_count += 1
-                    logger.info(f"  ✅ SPC dokument uložen: {len(pdf_content)} bytes")
-                else:
-                    logger.error(f"  ❌ Chyba při ukládání SPC dokumentu")
-            else:
-                logger.warning(f"  ⚠️  Prázdný SPC dokument pro {kod_sukl}")
+            pdf_content = api_client.download_document(kod_sukl, "spc", is_eu_registration)
+            if not pdf_content:
+                logger.warning(f"  ⚠️  Prázdný SPC dokument pro {kod_sukl} - přeskakuji")
+                continue
             
-            # Pauza mezi požadavky (aby se nezahlcovali server)
-            time.sleep(1)
+            # 4. Uložení léčiva do databáze (pouze pokud máme PDF)
+            if not db_manager.save_medicine(medicine_detail):
+                logger.error(f"❌ Chyba při ukládání léčiva: {kod_sukl}")
+                continue
+            
+            # 5. Uložení PDF dokumentu
+            doc_data = {
+                'id': kod_sukl,
+                'nazev': f'SPC_{kod_sukl}.pdf',
+                'typ': 'spc'
+            }
+            if db_manager.save_document(kod_sukl, doc_data, pdf_content):
+                success_count += 1
+                document_count += 1
+                logger.info(f"✅ Léčivo a PDF uloženo: {medicine_detail.get('nazev', kod_sukl)} ({len(pdf_content)} bytes)")
+            else:
+                logger.error(f"  ❌ Chyba při ukládání SPC dokumentu")
+            
+            # Pauza mezi požadavky - kratší pro lokální SÚKL, delší už je v download_document pro EMA
+            time.sleep(0.5 if not is_eu_registration else 1)
             
         except Exception as e:
             logger.error(f"Chyba při zpracování {kod_sukl}: {e}")
@@ -341,8 +401,13 @@ def main():
     
     logger.info("=" * 50)
     logger.info(f"🎉 Stahování dokončeno!")
-    logger.info(f"✅ Úspěšně uloženo léků: {success_count}")
-    logger.info(f"📄 Úspěšně uloženo dokumentů: {document_count}")
+    logger.info(f"📊 Statistiky:")
+    logger.info(f"   • Zpracováno léčiv: {processed_count}")
+    logger.info(f"   • Úspěšně uloženo léčiv s PDF: {success_count}")
+    logger.info(f"   • Úspěšně uloženo dokumentů: {document_count}")
+    if skipped_eu_count > 0:
+        logger.info(f"   • Přeskočeno EU registrací: {skipped_eu_count}")
+    logger.info(f"ℹ️  Pro stahování EU registrací nastavte SKIP_EU_REGISTRATIONS = False")
 
 if __name__ == "__main__":
     main() 
