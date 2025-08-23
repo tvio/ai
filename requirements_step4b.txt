@@ -1,0 +1,15 @@
+# Požadavky pro vektorové vyhledávání (step4b)
+# pgvector rozšíření pro PostgreSQL
+
+# Python knihovny - kompatibilní verze
+sentence-transformers>=2.5.0
+numpy>=1.21.0
+torch>=2.0.0
+transformers>=4.30.0
+huggingface-hub>=0.20.0
+
+# Databáze
+pg8000>=1.29.0
+
+# Typování
+typing-extensions>=4.0.0

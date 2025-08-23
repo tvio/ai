@@ -322,13 +322,51 @@ def main():
     logger.info(f"Načteno {len(medicine_codes)} léků k zpracování")
     
     # Nastavení pro test
-    TARGET_MEDICINES = 10  # Počet léčiv s PDF, které chceme získat
-    MAX_ATTEMPTS = 5000      # Maximální počet pokusů (aby se nám nezacyklilo)
+    TARGET_MEDICINES = 15  # Počet léčiv s PDF, které chceme získat
+    MAX_ATTEMPTS = 10000    # Maximální počet pokusů (aby se nám nezacyklilo)
+    
+    # ATC kódy pro léky s rozmanitými indikacemi
+    INTERESTING_ATC_CODES = [
+        'N02B',  # Analgetika (Paralen, Ibalgin)
+        'J01C',  # Beta-laktamová antibiotika (peniciliny)
+        'J01D',  # Cefalosporiny
+        'J01F',  # Makrolidy (azitromycin)
+        'J01M',  # Chinolony
+        'N05B',  # Anxiolytika (diazepam)
+        'N05C',  # Hypnotika a sedativa
+        'N06A',  # Antidepresiva
+        'A02B',  # Antacida a antiulcerózní léky
+        'C03',   # Diuretika
+        'C07',   # Beta-blokátory
+        'C08',   # Blokátory kalciových kanálů
+        'C09',   # ACE inhibitory a sartany
+        'M01A',  # Nesteroidní antirevmatika
+        'R06A',  # Antihistaminika (Kynedryl)
+        'R05',   # Antitusika a expektorancia
+        'A03',   # Spasmolytika
+        'A06',   # Laxativa
+        'A07',   # Antidiarrhoika
+        'D01',   # Antimykotika
+        'D06',   # Antibiotika a chemoterapeutika pro lokální použití
+        'G01',   # Gynekologická antimikrobiální látka
+        'H02',   # Kortikosteroidy pro systémové použití
+        'H03',   # Thyroidální hormony
+        'L01',   # Cytostatika
+        'P01',   # Antiprotozoální látky
+        'S01',   # Oftalmologické přípravky
+        'S02',   # Otologické přípravky
+    ]
     
     success_count = 0
     document_count = 0
     skipped_eu_count = 0
+    skipped_atc_count = 0
+    skipped_contrast_count = 0
+    skipped_duplicate_count = 0
     processed_count = 0
+    
+    # Set pro sledování již uložených názvů léků
+    saved_medicine_names = set()
     
     logger.info(f"Cíl: získat {TARGET_MEDICINES} léčiv s PDF dokumenty (max {MAX_ATTEMPTS} pokusů)")
     
@@ -353,6 +391,33 @@ def main():
                 logger.warning(f"  ⚠️  Nepodařilo se získat detail léku {kod_sukl}")
                 continue
             
+            # Kontrola ATC kódu - zajímají nás jen léky s rozmanitými indikacemi
+            atc_kod = medicine_detail.get('ATCkod', '')
+            if atc_kod:
+                # Kontrola, zda ATC kód začíná některým z zajímavých kódů
+                is_interesting = any(atc_kod.startswith(code) for code in INTERESTING_ATC_CODES)
+                if not is_interesting:
+                    logger.info(f"  ⏭️  Přeskakuji lék s ATC {atc_kod} - není v zajímavých kategoriích")
+                    skipped_atc_count += 1
+                    continue
+                else:
+                    logger.info(f"  ✅ Zajímavý ATC kód: {atc_kod}")
+            else:
+                logger.info(f"  ⚠️  Lék bez ATC kódu - přeskakuji")
+                skipped_atc_count += 1
+                continue
+            
+            # Kontrola názvu - vyhnout se kontrastním látkám a diagnostickým přípravkům
+            nazev = medicine_detail.get('nazev', '').lower()
+            skip_keywords = ['iomeron', 'omnipaque', 'ultravist', 'iopamiro', 'iopromid', 
+                           'gadolinium', 'gadovist', 'dotarem', 'primovist', 'magnevist',
+                           'kontrast', 'kontrastní', 'diagnostický', 'diagnostika']
+            
+            if any(keyword in nazev for keyword in skip_keywords):
+                logger.info(f"  ⏭️  Přeskakuji kontrastní látku: {medicine_detail.get('nazev', kod_sukl)}")
+                skipped_contrast_count += 1
+                continue
+            
             # Kontrola EU registrace
             registracni_cislo = medicine_detail.get('registracniCislo', '')
             is_eu_registration = str(registracni_cislo).startswith('EU')
@@ -365,6 +430,13 @@ def main():
             
             if is_eu_registration:
                 logger.info(f"  🇪🇺 EU registrace: {registracni_cislo}")
+            
+            # Kontrola duplicitních názvů - přeskočit pokud už máme lék se stejným názvem
+            medicine_name = medicine_detail.get('nazev', '').strip()
+            if medicine_name in saved_medicine_names:
+                logger.info(f"  ⏭️  Přeskakuji duplicitní název: {medicine_name} (už máme)")
+                skipped_duplicate_count += 1
+                continue
             
             # 3. Stahování SPC dokumentu nejdříve
             logger.info(f"  📄 Stahuji SPC dokument pro {kod_sukl}")
@@ -388,6 +460,8 @@ def main():
             if db_manager.save_document(kod_sukl, doc_data, pdf_content):
                 success_count += 1
                 document_count += 1
+                # Přidat název léku do setu pro kontrolu duplicit
+                saved_medicine_names.add(medicine_name)
                 logger.info(f"✅ Léčivo a PDF uloženo: {medicine_detail.get('nazev', kod_sukl)} ({len(pdf_content)} bytes)")
             else:
                 logger.error(f"  ❌ Chyba při ukládání SPC dokumentu")
@@ -405,9 +479,13 @@ def main():
     logger.info(f"   • Zpracováno léčiv: {processed_count}")
     logger.info(f"   • Úspěšně uloženo léčiv s PDF: {success_count}")
     logger.info(f"   • Úspěšně uloženo dokumentů: {document_count}")
-    if skipped_eu_count > 0:
-        logger.info(f"   • Přeskočeno EU registrací: {skipped_eu_count}")
+    logger.info(f"   • Přeskočeno EU registrací: {skipped_eu_count}")
+    logger.info(f"   • Přeskočeno nezájímavých ATC: {skipped_atc_count}")
+    logger.info(f"   • Přeskočeno kontrastních látek: {skipped_contrast_count}")
+    logger.info(f"   • Přeskočeno duplicitních názvů: {skipped_duplicate_count}")
     logger.info(f"ℹ️  Pro stahování EU registrací nastavte SKIP_EU_REGISTRATIONS = False")
+    logger.info(f"ℹ️  Filtrujeme jen léky s ATC kódy: {', '.join(INTERESTING_ATC_CODES[:10])}...")
+    logger.info(f"ℹ️  Kontrolujeme duplicitní názvy - každý lék jen jednou")
 
 if __name__ == "__main__":
     main() 
